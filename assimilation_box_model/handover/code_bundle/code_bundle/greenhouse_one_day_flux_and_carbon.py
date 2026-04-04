@@ -46,6 +46,18 @@ class Geometry:
 
 
 @dataclass(frozen=True)
+class ScreenLayer:
+    name: str
+    direct_shade_pct: float
+    diffuse_shade_pct: float
+    energy_saving_pct: float
+    shortwave_transmittance_closed: float
+    ua_closed_ratio: float
+    sky_coupling_closed_ratio: float
+    source: str
+
+
+@dataclass(frozen=True)
 class HousePreset:
     house_key: str
     display_name: str
@@ -71,6 +83,39 @@ class HousePreset:
     smooth_window: str = '5min'
     daylight_threshold_w_m2: float = 20.0
     vent_closed_threshold_pct: float = 0.5
+    screen_layers: tuple[ScreenLayer, ...] = ()
+
+
+LUXOUS_1547 = ScreenLayer(
+    name='Luxous 15 47',
+    direct_shade_pct=15.0,
+    diffuse_shade_pct=24.0,
+    energy_saving_pct=47.0,
+    shortwave_transmittance_closed=1.0 - 0.5 * (0.15 + 0.24),
+    ua_closed_ratio=0.75,
+    sky_coupling_closed_ratio=0.62,
+    source='Ludvig Svensson Luxous 1547 D FR public product data',
+)
+TEMPA_5557 = ScreenLayer(
+    name='Tempa 55 57',
+    direct_shade_pct=55.0,
+    diffuse_shade_pct=61.0,
+    energy_saving_pct=57.0,
+    shortwave_transmittance_closed=1.0 - 0.5 * (0.55 + 0.61),
+    ua_closed_ratio=0.68,
+    sky_coupling_closed_ratio=0.52,
+    source='Ludvig Svensson Tempa 5557 D public product data',
+)
+TEMPA_9870 = ScreenLayer(
+    name='Tempa 98 70',
+    direct_shade_pct=98.0,
+    diffuse_shade_pct=98.0,
+    energy_saving_pct=70.0,
+    shortwave_transmittance_closed=0.02,
+    ua_closed_ratio=0.58,
+    sky_coupling_closed_ratio=0.35,
+    source='Model assumption from public Svensson naming key and Japanese distributor catalog',
+)
 
 
 TRIANGLE_GEOM = Geometry(
@@ -98,6 +143,7 @@ TRIANGLE_PRESET = HousePreset(
     has_secondary_burner=False,
     main_cmd_candidates=('CO2',),
     secondary_cmd_candidates=(),
+    screen_layers=(LUXOUS_1547, TEMPA_5557),
 )
 
 MARU_GEOM = Geometry(
@@ -121,6 +167,7 @@ MARU_PRESET = HousePreset(
     has_secondary_burner=True,
     main_cmd_candidates=('CO2',),
     secondary_cmd_candidates=('CV_H2',),
+    screen_layers=(TEMPA_9870, LUXOUS_1547),
 )
 
 HOUSE_PRESETS = {
@@ -320,6 +367,56 @@ def night_screen_ach(screen_pct: pd.Series, wind_ms: pd.Series) -> pd.Series:
     ach[closed] = ach_closed[closed]
     ach[~closed] = ach_open[~closed]
     return ach.rename('Q_night_ach_screen')
+
+
+def optical_screen_closure(screen_pct: pd.Series, *, full_cover_pct: float = 90.0) -> pd.Series:
+    raw = screen_pct.fillna(0.0).astype(float).clip(lower=0.0, upper=100.0)
+    return (raw / float(full_cover_pct)).clip(lower=0.0, upper=1.0).rename('screen_optical_closure')
+
+
+def thermal_screen_closure(screen_pct: pd.Series) -> pd.Series:
+    raw = screen_pct.fillna(0.0).astype(float).clip(lower=0.0, upper=100.0)
+    return (raw / 100.0).clip(lower=0.0, upper=1.0).rename('screen_thermal_closure')
+
+
+def combine_screen_layers(
+    *,
+    screen_layers: Sequence[ScreenLayer],
+    screen_pct_1: pd.Series,
+    screen_pct_2: pd.Series,
+) -> pd.DataFrame:
+    idx = screen_pct_1.index
+    screen_series = [screen_pct_1, screen_pct_2]
+    tau_sw = pd.Series(1.0, index=idx, dtype=float)
+    ua_ratio = pd.Series(1.0, index=idx, dtype=float)
+    sky_ratio = pd.Series(1.0, index=idx, dtype=float)
+    optical_closures: list[pd.Series] = []
+    thermal_closures: list[pd.Series] = []
+
+    for i, layer in enumerate(screen_layers[:2]):
+        raw = screen_series[i]
+        optical = optical_screen_closure(raw)
+        thermal = thermal_screen_closure(raw)
+        tau_sw *= 1.0 - optical * (1.0 - float(layer.shortwave_transmittance_closed))
+        ua_ratio *= 1.0 - thermal * (1.0 - float(layer.ua_closed_ratio))
+        sky_ratio *= 1.0 - thermal * (1.0 - float(layer.sky_coupling_closed_ratio))
+        optical_closures.append(optical.rename(f'screen{i+1}_optical_closure'))
+        thermal_closures.append(thermal.rename(f'screen{i+1}_thermal_closure'))
+
+    if len(optical_closures) < 2:
+        for i in range(len(optical_closures), 2):
+            optical_closures.append(pd.Series(0.0, index=idx, dtype=float, name=f'screen{i+1}_optical_closure'))
+            thermal_closures.append(pd.Series(0.0, index=idx, dtype=float, name=f'screen{i+1}_thermal_closure'))
+
+    return pd.DataFrame({
+        'screen1_optical_closure': optical_closures[0],
+        'screen2_optical_closure': optical_closures[1],
+        'screen1_thermal_closure': thermal_closures[0],
+        'screen2_thermal_closure': thermal_closures[1],
+        'screen_shortwave_transmission': tau_sw.clip(lower=0.0, upper=1.0),
+        'screen_ua_ratio': ua_ratio.clip(lower=0.2, upper=1.0),
+        'screen_sky_ratio': sky_ratio.clip(lower=0.1, upper=1.0),
+    }, index=idx)
 
 
 def infer_step_hours(index: pd.DatetimeIndex) -> pd.Series:
@@ -523,6 +620,16 @@ class PreparedDay:
     wind: pd.Series
     roof_vent_max_pct: pd.Series
     screen_pct: pd.Series
+    screen1_pct: pd.Series
+    screen2_pct: pd.Series
+    screen1_optical_closure: pd.Series
+    screen2_optical_closure: pd.Series
+    screen1_thermal_closure: pd.Series
+    screen2_thermal_closure: pd.Series
+    screen_shortwave_transmission: pd.Series
+    screen_ua_ratio: pd.Series
+    screen_sky_ratio: pd.Series
+    delta_t_sky_eff_k: pd.Series
     heater_signal_pct: pd.Series
     s_co2_mol_s: pd.Series
     w_inj_kg_s: pd.Series
@@ -614,12 +721,36 @@ def prepare_day(
     model['W_inj'] = w_inj_kg_s
     model['UA'] = ua_eff
 
+    roof_cols = [c for c in ['CV_K1', 'CV_K2', 'CV_K3', 'CV_K4'] if c in g.columns]
+    if roof_cols:
+        roof_vent_max = g[roof_cols].apply(pd.to_numeric, errors='coerce').max(axis=1).reindex(idx)
+    else:
+        roof_vent_max = as_float_series(g, ['Kanki'], required=False, default=0.0)
+    screen1_pct = as_float_series(g, ['CV_C1'], required=False, default=0.0).clip(lower=0.0, upper=100.0)
+    screen2_pct = as_float_series(g, ['CV_C2'], required=False, default=0.0).clip(lower=0.0, upper=100.0)
+    screen_pct = pd.concat([screen1_pct, screen2_pct], axis=1).max(axis=1)
+    screen_effect = combine_screen_layers(
+        screen_layers=preset.screen_layers,
+        screen_pct_1=screen1_pct,
+        screen_pct_2=screen2_pct,
+    )
+
+    h_solar_w = h_solar_w * screen_effect['screen_shortwave_transmission']
+    h_in_w = h_burn_w + h_heat_w + h_solar_w
+    ua_eff = ua_eff * screen_effect['screen_ua_ratio']
+    delta_t_sky_eff_k = 2.0 * screen_effect['screen_sky_ratio']
+
+    model['H_in'] = h_in_w
+    model['UA'] = ua_eff
+    model['deltaT_sky'] = delta_t_sky_eff_k
+
     out_wind = wgc.solve_whole_greenhouse_timeseries(
         model,
         V_m3=preset.geometry.air_volume_m3,
         A_cov_m2=preset.geometry.cover_area_m2,
         UA_col='UA',
         W_inj_col='W_inj',
+        deltaT_sky_col='deltaT_sky',
         p_Pa=101325.0,
         h_c_W_m2_K=5.0,
         deltaT_sky_K=0.0,
@@ -628,16 +759,6 @@ def prepare_day(
         dh_eps_J_kg=200.0,
         enforce_Q_nonneg=False,
     )
-
-    roof_cols = [c for c in ['CV_K1', 'CV_K2', 'CV_K3', 'CV_K4'] if c in g.columns]
-    if roof_cols:
-        roof_vent_max = g[roof_cols].apply(pd.to_numeric, errors='coerce').max(axis=1).reindex(idx)
-    else:
-        roof_vent_max = as_float_series(g, ['Kanki'], required=False, default=0.0)
-    screen_pct = pd.concat([
-        as_float_series(g, ['CV_C1'], required=False, default=0.0),
-        as_float_series(g, ['CV_C2'], required=False, default=0.0),
-    ], axis=1).max(axis=1)
 
     return PreparedDay(
         g=g,
@@ -667,6 +788,16 @@ def prepare_day(
         wind=wind.fillna(0.0).ffill().bfill().fillna(0.0),
         roof_vent_max_pct=roof_vent_max.fillna(0.0),
         screen_pct=screen_pct.fillna(0.0),
+        screen1_pct=screen1_pct.fillna(0.0),
+        screen2_pct=screen2_pct.fillna(0.0),
+        screen1_optical_closure=screen_effect['screen1_optical_closure'],
+        screen2_optical_closure=screen_effect['screen2_optical_closure'],
+        screen1_thermal_closure=screen_effect['screen1_thermal_closure'],
+        screen2_thermal_closure=screen_effect['screen2_thermal_closure'],
+        screen_shortwave_transmission=screen_effect['screen_shortwave_transmission'],
+        screen_ua_ratio=screen_effect['screen_ua_ratio'],
+        screen_sky_ratio=screen_effect['screen_sky_ratio'],
+        delta_t_sky_eff_k=delta_t_sky_eff_k,
         heater_signal_pct=heater_signal_pct,
         s_co2_mol_s=s_co2_mol_s,
         w_inj_kg_s=w_inj_kg_s,
@@ -709,7 +840,7 @@ def apply_current_model(prep: PreparedDay) -> pd.DataFrame:
             prep.ua_eff_w_k.values,
             geom.cover_area_m2,
             h_c_W_m2_K=np.full(len(out), 5.0),
-            deltaT_sky_K=np.zeros(len(out)),
+            deltaT_sky_K=prep.delta_t_sky_eff_k.values,
             L_v=2.45e6,
             cp_da=1005.0,
             cond_only=False,
@@ -726,7 +857,7 @@ def apply_current_model(prep: PreparedDay) -> pd.DataFrame:
     r1 = out['rho_da'] * geom.air_volume_m3 * out['domega_dt'] - prep.w_inj_kg_s + w_cond_phys
     r2 = (
         prep.h_in_w
-        - prep.ua_eff_w_k * (out['T_in_C'] - out['T_out_C'])
+        - prep.ua_eff_w_k * (out['T_in_C'] - (out['T_out_C'] - prep.delta_t_sky_eff_k))
         - h_struct
         - out['rho_da'] * geom.air_volume_m3 * (cp_da + cp_v * out['omega_in']) * out['dT_dt']
         - ls * (prep.w_inj_kg_s - w_cond_phys)
@@ -814,6 +945,16 @@ def apply_current_model(prep: PreparedDay) -> pd.DataFrame:
     res['CO2_source_secondary_signal_col'] = prep.secondary_cmd_col if prep.secondary_cmd_col else ''
     res['roof_vent_max_pct'] = prep.roof_vent_max_pct
     res['screen_pct'] = prep.screen_pct
+    res['screen1_pct'] = prep.screen1_pct
+    res['screen2_pct'] = prep.screen2_pct
+    res['screen1_optical_closure'] = prep.screen1_optical_closure
+    res['screen2_optical_closure'] = prep.screen2_optical_closure
+    res['screen1_thermal_closure'] = prep.screen1_thermal_closure
+    res['screen2_thermal_closure'] = prep.screen2_thermal_closure
+    res['screen_shortwave_transmission'] = prep.screen_shortwave_transmission
+    res['screen_ua_ratio'] = prep.screen_ua_ratio
+    res['screen_sky_ratio'] = prep.screen_sky_ratio
+    res['deltaT_sky_eff_K'] = prep.delta_t_sky_eff_k
     res['heater_signal_pct'] = prep.heater_signal_pct
 
     res['gross_assimilation_gCO2_m2_h'] = gross_g_h
@@ -967,6 +1108,9 @@ def make_notes(prep: PreparedDay, res: pd.DataFrame, summary: pd.DataFrame) -> l
         f'- secondary source signal column = {s.secondary_source_signal_col if s.secondary_source_signal_col else "not used"}',
         f'- fuel rate main burner = {p.fuel_rate_l_h_main:.3f} L h-1 at 100%',
         f'- fuel rate secondary burner = {p.fuel_rate_l_h_secondary:.3f} L h-1 at 100%',
+        f'- screen closure model: optical closure saturates at 90% command, thermal closure reaches 100% at full command',
+        f'- screen 1 = {p.screen_layers[0].name if len(p.screen_layers) > 0 else "none"}',
+        f'- screen 2 = {p.screen_layers[1].name if len(p.screen_layers) > 1 else "none"}',
         f'- storage model: tau = {p.tau_store_min:.1f} min, C_eff = {p.c_eff_j_k:.4e} J K-1, beta_solar = {p.beta_solar:.6f}',
         f'- night respiration: R20 = {p.r20_umol_m2_s:.4f} umol m-2 s-1, Q10 = {p.q10:.4f}',
         f'- outdoor CO2 = {p.outdoor_co2_ppm:.1f} ppm',
