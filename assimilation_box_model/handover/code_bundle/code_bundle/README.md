@@ -27,6 +27,9 @@
 - 日射は `scaling_daily_2025.csv` の `scaling_daily` を使って補正します。
 - Sankaku の CO2 source は `CO2` 信号 1 本です。
 - Maru の CO2 source は `CO2` と `CV_H2` の 2 本です。
+- 外気湿度・外気 CO2 は次の 2 モードから選べます。
+  - 既定 `legacy`: 温室ログの `Out_T` と仮定露点差から外気 RH を推定し、外気 CO2 は固定値を使います。
+  - `outside_pf`: `outside_pf/YYYY-MM-DD/DATABASE_*.DB` の `AGLOG` から `絶対湿度` と `ＣＯ２濃度` を読みます。外気温は引き続き温室ログ側の `Out_T` を使い、絶対湿度から RH を再計算します。
 - source 信号は FOPDT で有効 source に変換します。
   - dead time = 4 min
   - tau = 8 min
@@ -67,6 +70,19 @@ python greenhouse_one_day_flux_and_carbon.py \
   --borrow-outdoor-from /path/to/sankaku_20260317.log \
   --output-dir out_maru_20260317_borrowed_outdoor
 ```
+
+### `outside_pf` を使って外気絶対湿度・外気 CO2 を与える
+
+```bash
+python greenhouse_one_day_flux_and_carbon.py \
+  --house sankaku \
+  --input-log /path/to/20260405.log \
+  --outdoor-humidity-co2-source outside_pf \
+  --outside-pf-root "$HOME/Library/CloudStorage/GoogleDrive-soi.toi.chi@gmail.com/マイドライブ/greenhouse_log/outside_pf" \
+  --output-dir out_sankaku_20260405
+```
+
+`--outside-pf-root` を省略した場合は、既知の Google Drive パスを自動探索します。
 
 ## シェルスクリプト
 

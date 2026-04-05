@@ -6,6 +6,7 @@ import argparse
 import datetime as dt
 import io
 import math
+import sqlite3
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -187,6 +188,13 @@ class RadiationScalingMatch:
     source: str
     note: str = ''
 
+
+@dataclass(frozen=True)
+class OutdoorHumidityCo2Source:
+    mode: str
+    outside_pf_root: str = ''
+    detail: str = ''
+
 # -----------------------------
 # Parsing helpers
 # -----------------------------
@@ -319,6 +327,22 @@ def estimate_outdoor_rh_from_dewpoint(t_out_c: pd.Series, dewpoint_offset_c: flo
     e_dew = float(wgc.e_s_tetens(dewpoint_c))
     rh_frac = np.clip(e_dew / wgc.e_s_tetens(t_out_c.to_numpy(dtype=float)), 0.0, 1.0)
     return pd.Series(rh_frac * 100.0, index=t_out_c.index, name='RH_out_est')
+
+
+def rh_pct_from_absolute_humidity_g_m3(absolute_humidity_g_m3: pd.Series, t_c: pd.Series) -> pd.Series:
+    ah = absolute_humidity_g_m3.astype(float).clip(lower=0.0)
+    t = t_c.astype(float)
+    vapor_pressure_pa = ah * (t + 273.15) / 216.7 * 100.0
+    rh_frac = np.clip(vapor_pressure_pa / wgc.e_s_tetens(t.to_numpy(dtype=float)), 0.0, 1.0)
+    return pd.Series(rh_frac * 100.0, index=t.index, name='RH_out_from_absolute_humidity')
+
+
+def absolute_humidity_g_m3_from_rh_pct(rh_pct: pd.Series, t_c: pd.Series) -> pd.Series:
+    rh_frac = rh_pct.astype(float).clip(lower=0.0, upper=100.0) / 100.0
+    t = t_c.astype(float)
+    vapor_pressure_hpa = rh_frac * pd.Series(wgc.e_s_tetens(t.to_numpy(dtype=float)), index=t.index) / 100.0
+    ah = 216.7 * vapor_pressure_hpa / (t + 273.15)
+    return ah.rename('absolute_humidity_g_m3')
 
 
 def h_out_mc_adams(u_ms: pd.Series | np.ndarray | float) -> np.ndarray:
@@ -572,6 +596,85 @@ def read_log(path: str | Path) -> pd.DataFrame:
     return parse_timestamp(read_text_table(path))
 
 
+def resolve_default_outside_pf_root() -> Optional[Path]:
+    candidates = [
+        Path.home() / 'Library/CloudStorage/GoogleDrive-soi.toi.chi@gmail.com/マイドライブ/greenhouse_log/outside_pf',
+        Path.home() / 'Google Drive/マイドライブ/greenhouse_log/outside_pf',
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def read_outside_pf_log(path: str | Path) -> pd.DataFrame:
+    query = """
+        SELECT
+            "年月日" AS ymd,
+            "時間" AS time,
+            "気温" AS temperature_c,
+            "湿度" AS rh_pct,
+            "絶対湿度" AS absolute_humidity_g_m3,
+            "ＣＯ２濃度" AS co2_ppm
+        FROM AGLOG
+    """
+    with sqlite3.connect(Path(path)) as con:
+        df = pd.read_sql_query(query, con)
+    if len(df) == 0:
+        return pd.DataFrame(columns=['temperature_c', 'rh_pct', 'absolute_humidity_g_m3', 'co2_ppm'])
+    df['timestamp'] = pd.to_datetime(df['ymd'].astype(str).str.strip() + ' ' + df['time'].astype(str).str.strip(), errors='coerce')
+    df = df.dropna(subset=['timestamp']).set_index('timestamp').sort_index()
+    for col in ['temperature_c', 'rh_pct', 'absolute_humidity_g_m3', 'co2_ppm']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df[['temperature_c', 'rh_pct', 'absolute_humidity_g_m3', 'co2_ppm']].groupby(level=0).mean().sort_index()
+
+
+def load_outside_pf_day(root: str | Path, target_date: dt.date) -> pd.DataFrame:
+    date_dir = Path(root) / target_date.isoformat()
+    if not date_dir.exists():
+        raise FileNotFoundError(f'outside_pf date directory not found: {date_dir}')
+    frames: list[pd.DataFrame] = []
+    for db_path in sorted(date_dir.glob('DATABASE_*.DB')):
+        if db_path.name == 'DATABASE_MASTER.DB':
+            continue
+        try:
+            df = read_outside_pf_log(db_path)
+        except sqlite3.DatabaseError:
+            continue
+        if len(df) > 0:
+            frames.append(df)
+    if not frames:
+        raise ValueError(f'No AGLOG rows found in outside_pf DB files under {date_dir}')
+    return pd.concat(frames).groupby(level=0).mean().sort_index()
+
+
+def resolve_outdoor_humidity_and_co2(
+    *,
+    main_index: pd.DatetimeIndex,
+    t_out: pd.Series,
+    preset: HousePreset,
+    humidity_co2_source: OutdoorHumidityCo2Source,
+) -> tuple[pd.Series, pd.Series, pd.Series, str]:
+    if humidity_co2_source.mode == 'legacy':
+        rh_out = estimate_outdoor_rh_from_dewpoint(t_out.astype(float), preset.dewpoint_offset_c)
+        x_out = pd.Series(float(preset.outdoor_co2_ppm), index=main_index, name='X_out')
+        ah_out = absolute_humidity_g_m3_from_rh_pct(rh_out, t_out.astype(float))
+        detail = f'legacy dewpoint-offset RH + fixed outdoor CO2 {preset.outdoor_co2_ppm:.1f} ppm'
+        return rh_out, x_out, ah_out, detail
+
+    if humidity_co2_source.mode != 'outside_pf':
+        raise ValueError(f'Unsupported outdoor humidity/CO2 source mode: {humidity_co2_source.mode}')
+    if not humidity_co2_source.outside_pf_root:
+        raise ValueError('outside_pf mode requires an outside_pf root directory.')
+
+    pf_day = load_outside_pf_day(humidity_co2_source.outside_pf_root, main_index[0].date())
+    ah_out = align_to_index(pf_day['absolute_humidity_g_m3'], main_index).rename('AH_out')
+    x_out = align_to_index(pf_day['co2_ppm'], main_index).rename('X_out')
+    rh_out = rh_pct_from_absolute_humidity_g_m3(ah_out, t_out.astype(float))
+    detail = f'outside_pf AGLOG absolute humidity + CO2 from {humidity_co2_source.outside_pf_root}'
+    return rh_out, x_out, ah_out, detail
+
+
 def borrow_outdoor_series(main_index: pd.DatetimeIndex, main_log: pd.DataFrame, reference_log: Optional[pd.DataFrame]) -> tuple[pd.Series, pd.Series, pd.Series, str]:
     if reference_log is None:
         sun = as_float_series(main_log, ['Sun.L', 'Sun', 'I.Sun'], required=False, default=0.0)
@@ -617,6 +720,7 @@ class PreparedDay:
     t_out: pd.Series
     rh_out: pd.Series
     x_out: pd.Series
+    outdoor_absolute_humidity_g_m3: pd.Series
     wind: pd.Series
     roof_vent_max_pct: pd.Series
     screen_pct: pd.Series
@@ -641,6 +745,7 @@ class PreparedDay:
     ua_base_u_w_m2_k: float
     r_fixed_m2_k_w: float
     outdoor_mode_desc: str
+    outdoor_humidity_co2_desc: str
 
 
 def prepare_day(
@@ -648,6 +753,7 @@ def prepare_day(
     *,
     preset: HousePreset,
     borrow_outdoor_from: Optional[str | Path] = None,
+    outdoor_humidity_co2_source: OutdoorHumidityCo2Source = OutdoorHumidityCo2Source(mode='legacy'),
     radiation_scaling_csv: Optional[str | Path] = None,
     radiation_scaling_mode: str = 'off',
 ) -> PreparedDay:
@@ -670,8 +776,12 @@ def prepare_day(
     if solar_scaling.enabled:
         outdoor_mode = f'{outdoor_mode}; Sun.L scaling x{solar_scaling.factor:.4f} ({solar_scaling.match_mode}:{solar_scaling.matched_date})'
 
-    rh_out = estimate_outdoor_rh_from_dewpoint(t_out.astype(float), preset.dewpoint_offset_c)
-    x_out = pd.Series(float(preset.outdoor_co2_ppm), index=idx, name='X_out')
+    rh_out, x_out, outdoor_absolute_humidity_g_m3, outdoor_humidity_co2_desc = resolve_outdoor_humidity_and_co2(
+        main_index=idx,
+        t_out=t_out,
+        preset=preset,
+        humidity_co2_source=outdoor_humidity_co2_source,
+    )
 
     cmd1_raw, main_cmd_col = read_signal_series(g, preset.main_cmd_candidates, default=0.0)
     cmd1 = cmd1_raw.clip(lower=0.0, upper=100.0)
@@ -785,6 +895,7 @@ def prepare_day(
         t_out=t_out,
         rh_out=rh_out,
         x_out=x_out,
+        outdoor_absolute_humidity_g_m3=outdoor_absolute_humidity_g_m3,
         wind=wind.fillna(0.0).ffill().bfill().fillna(0.0),
         roof_vent_max_pct=roof_vent_max.fillna(0.0),
         screen_pct=screen_pct.fillna(0.0),
@@ -809,6 +920,7 @@ def prepare_day(
         ua_base_u_w_m2_k=u_base,
         r_fixed_m2_k_w=r_fixed,
         outdoor_mode_desc=outdoor_mode,
+        outdoor_humidity_co2_desc=outdoor_humidity_co2_desc,
     )
 
 
@@ -970,6 +1082,7 @@ def apply_current_model(prep: PreparedDay) -> pd.DataFrame:
     res['RH_in_frac'] = out['RH_in_frac']
     res['T_out_C'] = prep.t_out
     res['RH_out_pct'] = prep.rh_out
+    res['AH_out_g_m3'] = prep.outdoor_absolute_humidity_g_m3
     res['CO2_in_ppm'] = prep.x_in_raw
     res['CO2_out_ppm'] = prep.x_out
     res['Wind_m_s'] = prep.wind
@@ -1010,7 +1123,16 @@ def apply_current_model(prep: PreparedDay) -> pd.DataFrame:
 # -----------------------------
 # Outputs
 # -----------------------------
-def build_summary(res: pd.DataFrame, *, preset: HousePreset, outdoor_mode_desc: str, input_log: str | Path, borrow_outdoor_from: Optional[str | Path], solar_scaling: RadiationScalingMatch) -> pd.DataFrame:
+def build_summary(
+    res: pd.DataFrame,
+    *,
+    preset: HousePreset,
+    outdoor_mode_desc: str,
+    outdoor_humidity_co2_desc: str,
+    input_log: str | Path,
+    borrow_outdoor_from: Optional[str | Path],
+    solar_scaling: RadiationScalingMatch,
+) -> pd.DataFrame:
     coverage_h = float(res['dt_h'].sum())
     daytime_h = float(res.loc[res['day_mask'] > 0, 'dt_h'].sum())
     gross_day = float((res['gross_assimilation_gCO2_m2_h'] * res['dt_h']).sum())
@@ -1056,6 +1178,7 @@ def build_summary(res: pd.DataFrame, *, preset: HousePreset, outdoor_mode_desc: 
         'solar_scaling_source': solar_scaling.source,
         'solar_scaling_note': solar_scaling.note,
         'outdoor_mode': outdoor_mode_desc,
+        'outdoor_humidity_co2_source': outdoor_humidity_co2_desc,
         'main_source_signal_col': str(res['CO2_source_main_signal_col'].iloc[0]),
         'secondary_source_signal_col': str(res['CO2_source_secondary_signal_col'].iloc[0]),
         'input_log': str(input_log),
@@ -1080,6 +1203,7 @@ def make_notes(prep: PreparedDay, res: pd.DataFrame, summary: pd.DataFrame) -> l
         '## Input',
         f'- input log: {s.input_log}',
         f'- outdoor forcing: {prep.outdoor_mode_desc}',
+        f'- outdoor humidity / CO2: {s.outdoor_humidity_co2_source}',
         f'- borrowed outdoor log: {s.borrow_outdoor_from if s.borrow_outdoor_from else "none"}',
         '',
         '## Geometry',
@@ -1113,8 +1237,9 @@ def make_notes(prep: PreparedDay, res: pd.DataFrame, summary: pd.DataFrame) -> l
         f'- screen 2 = {p.screen_layers[1].name if len(p.screen_layers) > 1 else "none"}',
         f'- storage model: tau = {p.tau_store_min:.1f} min, C_eff = {p.c_eff_j_k:.4e} J K-1, beta_solar = {p.beta_solar:.6f}',
         f'- night respiration: R20 = {p.r20_umol_m2_s:.4f} umol m-2 s-1, Q10 = {p.q10:.4f}',
-        f'- outdoor CO2 = {p.outdoor_co2_ppm:.1f} ppm',
-        f'- outdoor RH estimation: early-morning minimum Out_T - {p.dewpoint_offset_c:.1f} C',
+        f'- outdoor humidity / CO2 source = {s.outdoor_humidity_co2_source}',
+        f'- legacy outdoor CO2 = {p.outdoor_co2_ppm:.1f} ppm',
+        f'- legacy outdoor RH estimation: early-morning minimum Out_T - {p.dewpoint_offset_c:.1f} C',
         f'- day threshold for gross assimilation = scaled Sun.L > {p.daylight_threshold_w_m2:.1f} W m-2',
         '',
         '## Daily summary',
@@ -1275,6 +1400,8 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument('--house', required=True, choices=sorted(HOUSE_PRESETS), help='House preset to use.')
     ap.add_argument('--input-log', required=True, help='Daily greenhouse log (.log / .csv).')
     ap.add_argument('--borrow-outdoor-from', default=None, help='Optional reference daily log. If set, Sun.L / Out_T / Wind are borrowed from this log.')
+    ap.add_argument('--outdoor-humidity-co2-source', default='legacy', choices=['legacy', 'outside_pf'], help='How to provide outdoor humidity and CO2. legacy uses fixed outdoor CO2 + dewpoint-offset RH. outside_pf reads AGLOG absolute humidity and CO2 from Profinder DBs.')
+    ap.add_argument('--outside-pf-root', default=None, help='Root directory of outside_pf logs. Date subdirectories like YYYY-MM-DD are expected when --outdoor-humidity-co2-source=outside_pf.')
     ap.add_argument('--output-dir', default='one_day_flux_output', help='Output directory.')
     ap.add_argument('--radiation-scaling-csv', default=None, help='Optional daily radiation scaling CSV. If omitted, bundled scaling_daily_2025.csv is used when present.')
     ap.add_argument('--radiation-scaling-mode', default='auto', choices=['auto', 'exact', 'monthday', 'off'], help='How to match the radiation scaling row to the input-log date.')
@@ -1337,11 +1464,18 @@ def main() -> None:
 
     default_scaling_csv = resolve_default_radiation_scaling_csv(Path(__file__).resolve().parent)
     radiation_scaling_csv = args.radiation_scaling_csv or (str(default_scaling_csv) if default_scaling_csv else None)
+    default_outside_pf_root = resolve_default_outside_pf_root()
+    outside_pf_root = args.outside_pf_root or (str(default_outside_pf_root) if default_outside_pf_root else '')
+    outdoor_humidity_co2_source = OutdoorHumidityCo2Source(
+        mode=args.outdoor_humidity_co2_source,
+        outside_pf_root=outside_pf_root,
+    )
 
     prep = prepare_day(
         args.input_log,
         preset=preset,
         borrow_outdoor_from=args.borrow_outdoor_from,
+        outdoor_humidity_co2_source=outdoor_humidity_co2_source,
         radiation_scaling_csv=radiation_scaling_csv,
         radiation_scaling_mode=args.radiation_scaling_mode,
     )
@@ -1350,6 +1484,7 @@ def main() -> None:
         res,
         preset=preset,
         outdoor_mode_desc=prep.outdoor_mode_desc,
+        outdoor_humidity_co2_desc=prep.outdoor_humidity_co2_desc,
         input_log=args.input_log,
         borrow_outdoor_from=args.borrow_outdoor_from,
         solar_scaling=prep.solar_scaling,
