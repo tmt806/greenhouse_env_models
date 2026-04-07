@@ -626,25 +626,44 @@ def read_outside_pf_log(path: str | Path) -> pd.DataFrame:
     df = df.dropna(subset=['timestamp']).set_index('timestamp').sort_index()
     for col in ['temperature_c', 'rh_pct', 'absolute_humidity_g_m3', 'co2_ppm']:
         df[col] = pd.to_numeric(df[col], errors='coerce')
+    df['ymd_date'] = pd.to_datetime(df['ymd'], errors='coerce').dt.date
     return df[['temperature_c', 'rh_pct', 'absolute_humidity_g_m3', 'co2_ppm']].groupby(level=0).mean().sort_index()
 
 
 def load_outside_pf_day(root: str | Path, target_date: dt.date) -> pd.DataFrame:
-    date_dir = Path(root) / target_date.isoformat()
-    if not date_dir.exists():
-        raise FileNotFoundError(f'outside_pf date directory not found: {date_dir}')
+    root_path = Path(root)
     frames: list[pd.DataFrame] = []
-    for db_path in sorted(date_dir.glob('DATABASE_*.DB')):
+    for db_path in sorted(root_path.rglob('DATABASE_*.DB')):
         if db_path.name == 'DATABASE_MASTER.DB':
             continue
         try:
-            df = read_outside_pf_log(db_path)
+            query = """
+                SELECT
+                    "年月日" AS ymd,
+                    "時間" AS time,
+                    "気温" AS temperature_c,
+                    "湿度" AS rh_pct,
+                    "絶対湿度" AS absolute_humidity_g_m3,
+                    "ＣＯ２濃度" AS co2_ppm
+                FROM AGLOG
+            """
+            with sqlite3.connect(db_path) as con:
+                df = pd.read_sql_query(query, con)
         except sqlite3.DatabaseError:
             continue
-        if len(df) > 0:
-            frames.append(df)
+        if len(df) == 0:
+            continue
+        ymd = pd.to_datetime(df['ymd'], errors='coerce').dt.date
+        df = df.loc[ymd == target_date].copy()
+        if len(df) == 0:
+            continue
+        df['timestamp'] = pd.to_datetime(df['ymd'].astype(str).str.strip() + ' ' + df['time'].astype(str).str.strip(), errors='coerce')
+        df = df.dropna(subset=['timestamp']).set_index('timestamp').sort_index()
+        for col in ['temperature_c', 'rh_pct', 'absolute_humidity_g_m3', 'co2_ppm']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        frames.append(df[['temperature_c', 'rh_pct', 'absolute_humidity_g_m3', 'co2_ppm']])
     if not frames:
-        raise ValueError(f'No AGLOG rows found in outside_pf DB files under {date_dir}')
+        raise ValueError(f'No AGLOG rows found in outside_pf DB files under {root_path} for {target_date.isoformat()}')
     return pd.concat(frames).groupby(level=0).mean().sort_index()
 
 
